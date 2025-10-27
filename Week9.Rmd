@@ -1,0 +1,224 @@
+---
+title: "NYT Top Stories — API to DataFrame (Assignment)"
+author: "Taha Malik"
+date: "2025-10-26"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    code_folding: hide
+    highlight: tango
+params:
+  api_key: NA
+  sections: ["home","world","technology"]
+  save_raw: true
+  output_csv: "nyt_topstories_combined.csv"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+`%||%` <- function(a, b) if (!is.null(a)) a else b
+```
+
+# Overview
+
+This R Markdown fetches the New York Times Top Stories API, parses the JSON, and returns a tidy data frame. It includes robust key handling, diagnostics, retries, caching during development, raw JSON audit saving, and basic tests to help secure maximum credit.
+
+IMPORTANT: Do NOT hard-code or commit API keys. Provide your key via params (only for private grading) or via environment variable (~/.Renviron: NYT_API_KEY=your_key), then restart R.
+
+# Libraries
+
+```{r libraries}
+library(httr)
+library(jsonlite)
+library(dplyr)
+library(tibble)
+library(purrr)
+library(lubridate)
+library(readr)
+#library(knitr)
+library(memoise)
+library(glue)
+library(progress)
+library(testthat)
+```
+
+# API key helper and diagnostic (fails fast, clear messages)
+
+This helper prefers params$api_key (if provided and not NA/"NA"/empty), otherwise reads Sys.getenv("NYT_API_KEY"). It trims whitespace, detects literal "NA" and stops with clear instructions.
+
+```{r get-api-key}
+get_api_key <- function(param_key = params$api_key) {
+  key <- param_key
+  if (is.null(key) || identical(key, NA) || identical(key, "NA") || trimws(as.character(key)) == "") {
+    key <- Sys.getenv("NYT_API_KEY", unset = NA_character_)
+    if (is.na(key) || trimws(key) == "") {
+      stop(
+        "NYT API key not provided.\nOptions:\n",
+        " - Add `NYT_API_KEY=your_key` to ~/.Renviron and restart R,\n",
+        " - Or pass api_key via params when rendering (not recommended to commit),\n",
+        " - Or run Sys.setenv(NYT_API_KEY = 'your_key') in your R console (interactive only)."
+      )
+    } else {
+      message("Using API key from ~/.Renviron or environment variable.")
+    }
+  } else {
+    key <- trimws(as.character(key))
+    message("Using API key provided via params$api_key.")
+  }
+  if (identical(key, "NA") || key == "") stop("API key appears invalid (NA or empty).")
+  key
+}
+```
+
+Run an early check so the document fails fast with a helpful message if the key is missing. This chunk is useful when knitting because Knit starts a new R process.
+
+```{r early-key-check}
+try({
+  key_for_check <- get_api_key(params$api_key)
+  message("API key check passed. Key length: ", nchar(key_for_check), " (not shown for security).")
+}, silent = FALSE)
+```
+
+# Diagnostic helper (quick test)
+
+Use test_api_key(api_key = "your_key") to inspect the endpoint response and confirm the key works. This is helpful when debugging 401s.
+
+```{r test-api-key}
+test_api_key <- function(api_key = params$api_key, section = "home", verbose = TRUE) {
+  key <- api_key
+  if (is.null(key) || identical(key, NA) || key == "") key <- Sys.getenv("NYT_API_KEY", unset = NA_character_)
+  if (is.null(key) || identical(key, NA) || key == "") stop("No API key provided to test_api_key().")
+  url <- sprintf("https://api.nytimes.com/svc/topstories/v2/%s.json", section)
+  if (verbose) message("Testing key against: ", url)
+  resp <- httr::GET(url, query = list("api-key" = key), httr::timeout(10))
+  status <- httr::status_code(resp)
+  body_text <- tryCatch(httr::content(resp, as = "text", encoding = "UTF-8"), error = function(e) "<unreadable body>")
+  if (verbose) {
+    message("HTTP status: ", status)
+    message("Response body excerpt:\n", paste(head(unlist(strsplit(body_text, "\n")), 20), collapse = "\n"))
+  }
+  invisible(list(status = status, body = body_text, response = resp))
+}
+```
+
+# Robust GET & caching for development
+
+We memoise GET during development to avoid hitting rate limits while iterating. Memoise can be disabled by use_cache = FALSE.
+
+```{r memo-get}
+memo_get <- memoise::memoise(function(url, query) {
+  httr::RETRY("GET", url, query = query, times = 4, pause_base = 1, pause_cap = 8)
+})
+```
+
+# Core function: get_top_stories()
+
+This fetches a section, saves raw JSON (if requested), and returns a tidy tibble. It surfaces server messages on 401 for debugging.
+
+```{r get-top-stories}
+get_top_stories <- function(section = "home",
+                           api_key = NULL,
+                           save_raw = params$save_raw,
+                           verbose = TRUE,
+                           use_cache = TRUE) {
+  api_key <- get_api_key(api_key)
+  section <- tolower(section)
+  base <- "https://api.nytimes.com/svc/topstories/v2"
+  url <- sprintf("%s/%s.json", base, section)
+  if (verbose) message(glue::glue("Requesting: {url}"))
+  resp <- if (isTRUE(use_cache)) memo_get(url, query = list("api-key" = api_key)) else httr::RETRY("GET", url, query = list("api-key" = api_key), times = 4)
+  status <- httr::status_code(resp)
+  if (status == 401) {
+    body_text <- tryCatch(httr::content(resp, as = "text", encoding = "UTF-8"), error = function(e) "<unreadable body>")
+    stop(glue::glue("401 Unauthorized: API key invalid or expired. Server response (excerpt):\n{paste(head(strsplit(body_text, '\\n')[[1]], 10), collapse='\\n')}"))
+  }
+  httr::stop_for_status(resp)
+  raw_text <- httr::content(resp, as = "text", encoding = "UTF-8")
+  json <- jsonlite::fromJSON(raw_text, simplifyVector = FALSE)
+  results <- json$results %||% list()
+  if (isTRUE(save_raw)) {
+    dir.create("data/raw", showWarnings = FALSE, recursive = TRUE)
+    safe_fname <- glue::glue("data/raw/nyt_topstories_{section}_{format(Sys.time(), '%Y%m%d_%H%M%S')}.json")
+    writeLines(raw_text, con = safe_fname)
+    if (verbose) message("Saved raw JSON to: ", safe_fname)
+  }
+  paste_facets <- function(x) if (is.null(x) || length(x) == 0) NA_character_ else paste(x, collapse = "; ")
+  df <- tibble(
+    section = map_chr(results, ~ .x$section %||% NA_character_),
+    subsection = map_chr(results, ~ .x$subsection %||% NA_character_),
+    title = map_chr(results, ~ .x$title %||% NA_character_),
+    abstract = map_chr(results, ~ .x$abstract %||% NA_character_),
+    byline = map_chr(results, ~ .x$byline %||% NA_character_),
+    item_type = map_chr(results, ~ .x$item_type %||% NA_character_),
+    kicker = map_chr(results, ~ .x$kicker %||% NA_character_),
+    url = map_chr(results, ~ .x$url %||% NA_character_),
+    short_url = map_chr(results, ~ .x$short_url %||% NA_character_),
+    published_date_raw = map_chr(results, ~ .x$published_date %||% NA_character_),
+    material_type_facet = map_chr(results, ~ .x$material_type_facet %||% NA_character_),
+    des_facet = map_chr(results, ~ paste_facets(.x$des_facet %||% NULL)),
+    org_facet = map_chr(results, ~ paste_facets(.x$org_facet %||% NULL)),
+    per_facet = map_chr(results, ~ paste_facets(.x$per_facet %||% NULL)),
+    geo_facet = map_chr(results, ~ paste_facets(.x$geo_facet %||% NULL)),
+    multimedia_count = map_int(results, ~ { mm <- .x$multimedia; if (is.null(mm)) 0L else length(mm) }),
+    top_image_url = map_chr(results, ~ {
+      mm <- .x$multimedia
+      if (is.null(mm) || length(mm) == 0) return(NA_character_)
+      preferred <- c("superJumbo","Jumbo","Large","Large Thumbnail","thumbLarge","mediumThreeByTwo440")
+      formats <- purrr::map_chr(mm, ~ .x$format %||% "")
+      idx <- which(tolower(formats) %in% tolower(preferred))
+      if (length(idx) == 0) mm[[1]]$url %||% NA_character_ else mm[[idx[1]]]$url %||% NA_character_
+    }),
+    multimedia = map(results, ~ .x$multimedia %||% list()),
+    raw_article = map(results, ~ .x)
+  ) %>%
+    mutate(published_date = suppressWarnings(lubridate::ymd_hms(published_date_raw, tz = "UTC")),
+           fetched_at = lubridate::with_tz(Sys.time(), tzone = "UTC"))
+  df
+}
+```
+
+# Example: fetch one section (interactive)
+
+Run these in your console (or knit after ensuring the key is available to the knit session).
+
+```{r example-fetch, eval=FALSE}
+# Interactive example (set the key in console first or put it in ~/.Renviron)
+# Sys.setenv(NYT_API_KEY = "your_real_key_here")  # interactive only, do NOT commit
+home_df <- get_top_stories("home")
+dplyr::glimpse(home_df)
+```
+
+# Example: fetch multiple sections and combine
+
+```{r fetch-multiple, eval=FALSE}
+sections <- params$sections
+api_key_run <- get_api_key(params$api_key)   # call once, reuse
+pb <- progress::progress_bar$new(total = length(sections))
+
+# Use set_names + .id so map_dfr creates the source_section column for you
+combined <- purrr::map_dfr(set_names(sections), function(sec) {
+  pb$tick()
+  get_top_stories(sec, api_key = api_key_run, save_raw = params$save_raw, verbose = FALSE)
+}, .id = "source_section")
+
+nrow(combined)
+dplyr::glimpse(combined)
+```
+
+# Save outputs
+
+```{r save-outputs, eval=FALSE}
+# Save processed CSV (omit raw nested raw_article to keep CSV clean)
+readr::write_csv(combined %>% select(-raw_article), params$output_csv)
+message("Saved processed CSV to: ", params$output_csv)
+```
+
+# Sanity checks (for grading)
+
+```{r tests, eval=FALSE}
+test_that("combined has expected columns and rows", {
+  expect_true(nrow(combined) > 0)
+  expect_true(all(c("title","url","published_date") %in% colnames(combined)))
+})
+```
